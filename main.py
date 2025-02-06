@@ -11,6 +11,8 @@ import aiohttp
 from collections import defaultdict
 from operator import itemgetter
 from discord.utils import get
+from data import load_user_stats, save_user_stats  # Importing from data.py
+
 
 # STEP 0: Load token
 load_dotenv()
@@ -26,7 +28,7 @@ client = commands.Bot(command_prefix="!", intents=intents)
 # Configuration variables
 CHANNEL_ID = 1333839623037915166 
 REQUIRED_ROLE_NAME = "job challenge"
-TIME_LIMIT = 10  # seconds to post image before warning/removal
+TIME_LIMIT = 40  # seconds to post image before warning/removal
 last_image_times = {}  # Track when users post images
 
 # Add this after the client initialization
@@ -34,12 +36,7 @@ last_image_times = {}  # Track when users post images
 BUTTON_CHANNEL_ID = 1333848120211017840
 
 # Add after other configuration variables
-user_stats = {
-    'streaks': defaultdict(int),      # Current streak for each user
-    'total_images': defaultdict(int),  # Total images sent by each user
-    'eliminations': set(),            # Set of users who have been eliminated
-    'warnings': defaultdict(int)      # Track warnings for each user
-}
+user_stats = load_user_stats()  # Load user stats from the database
 
 # Add these global variables
 global_vars = {
@@ -525,6 +522,28 @@ async def show_guide(ctx):
     embed.set_footer(text="Note: Admin commands require the 'admin' role to use.")
 
     await ctx.send(embed=embed)
+
+@client.command(name='complete_module_9')
+@commands.has_role('admin')
+async def complete_module_9(ctx, member: discord.Member):
+    user_stats['completed_modules'][member.id].add('Module 9')
+    save_user_stats(member.id)  # Save stats after updating
+    await ctx.send(f"✅ {member.mention} has been marked as completed for Module 9.")
+
+@client.command(name='complete_module_10')
+@commands.has_role('admin')
+async def complete_module_10(ctx, member: discord.Member):
+    # Check if the user is already marked as completed for the modules
+    if 'completed_modules' not in user_stats:
+        user_stats['completed_modules'] = defaultdict(set)  # Initialize if not present
+
+    # Add Module 10 to the user's completed list
+    user_stats['completed_modules'][member.id].add('Module 10')
+
+    # Send confirmation message
+    await ctx.send(f"✅ {member.mention} has been marked as completed for Module 10.")
+    print(f"[DEBUG] {member.name} marked as completed for Module 10.")
+
 
 # STEP 5: Main entry point
 def main() -> None:
