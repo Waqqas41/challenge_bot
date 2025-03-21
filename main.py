@@ -1,551 +1,363 @@
-from typing import Final
-import os
-from dotenv import load_dotenv
-from discord import Intents, Message
-from discord.ui import Button, View
-import discord
+from dotenv import load_dotenv # type: ignore
+import os 
 from discord.ext import commands
+import discord
+from typing import Final
+from discord import Intents
 from discord.ext import tasks
-from datetime import datetime
-import aiohttp
-from collections import defaultdict
-from operator import itemgetter
-from discord.utils import get
-from data import load_user_stats, save_user_stats  # Importing from data.py
+import datetime
+import json
 
-
-# STEP 0: Load token
+# Load token
 load_dotenv()
 TOKEN: Final[str] = os.getenv("DISCORD_TOKEN")
 
-# STEP 1: BOT SETUP
-intents: Intents = Intents.default()
-intents.message_content = True
+# Bot setup
+intents = discord.Intents.all()
 intents.guilds = True
+intents.message_content = True
 intents.members = True
-client = commands.Bot(command_prefix="!", intents=intents)
+client = commands.Bot(command_prefix=";", intents=intents)
 
-# Configuration variables
-CHANNEL_ID = 1333839623037915166 
-REQUIRED_ROLE_NAME = "job challenge"
-TIME_LIMIT = 40  # seconds to post image before warning/removal
-last_image_times = {}  # Track when users post images
-
-# Add this after the client initialization
-# BUTTON_MESSAGE_ID = 1333848152696029204
-BUTTON_CHANNEL_ID = 1333848120211017840
-
-# Add after other configuration variables
-user_stats = load_user_stats()  # Load user stats from the database
-
-# Add these global variables
-global_vars = {
-    'bot_enabled': True  # Store bot state in a dictionary to avoid global scope issues
-}
-
-# Add a new dictionary to track the time of the last warning sent
-last_warning_times = defaultdict(lambda: None)
-
-# STEP 2: Message functionality
-async def send_message(message: Message, user_message: str) -> None:
-    if not user_message:
-        print("(Message was empty because intents were not enabled)")
-        return
-
-    if is_private := user_message[0] == "?":
-        user_message = user_message[1:]
-
-    try:
-        response: str = get_response(user_message)
-        await message.author.send(response) if is_private else await message.channel.send(response)
-    except Exception as e:
-        print(e)
-
-# STEP 3: Role removal task
-@tasks.loop(seconds=TIME_LIMIT)
-async def check_roles():
-    if not global_vars['bot_enabled']:
-        return
-        
-    channel = client.get_channel(CHANNEL_ID)
-    if not channel:
-        print(f"[DEBUG] Could not find channel with ID {CHANNEL_ID}")
-        return
-
-    current_time = datetime.now()
-    print(f"\n[DEBUG] ========== CHECKING ROLES AT {current_time} ==========")
-    
-    role = discord.utils.get(channel.guild.roles, name=REQUIRED_ROLE_NAME)
-    if not role:
-        print(f"[DEBUG] Could not find role {REQUIRED_ROLE_NAME}")
-        return
-        
-    members_with_role = [member for member in channel.guild.members if role in member.roles]
-    member_count = len(members_with_role)
-    print(f"[DEBUG] Found {member_count} members with the {REQUIRED_ROLE_NAME} role")
-    
-    for member in members_with_role:
-        if member.bot:
-            continue
-            
-        last_image_time = last_image_times.get(member.id)  # This can be None if not set
-        current_warnings = user_stats['warnings'][member.id]
-        last_warning_time = last_warning_times[member.id]
-
-        # If last_image_time is None or not set, treat it as if the user has not posted an image
-        if last_image_time is None:
-            print(f"[DEBUG] {member.name} has no recorded last image time.")
-            time_since_last_image = float('inf')  # Treat as if a long time has passed
-        else:
-            time_since_last_image = (current_time - last_image_time).total_seconds()
-            print(f"[DEBUG] Time since last image for {member.name}: {time_since_last_image} seconds")
-        
-        if time_since_last_image <= TIME_LIMIT:  # Keep role if image posted within time limit
-            print(f"[DEBUG] {member.name} keeps role (posted image recently)")
-            # Reset warnings if they post in time
-            user_stats['warnings'][member.id] = 0  # Reset warnings
-            continue
-
-        # Handle warnings and role removal
-        if current_warnings == 0:
-            # First warning
-            user_stats['warnings'][member.id] += 1  # Increment warnings
-            print(f"[DEBUG] First warning for {member.name}")
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            last_warning_times[member.id] = current_time  # Track when the warning was sent
-            try:
-                await member.send(f"You need to post an image every day to stay in the Job Challenge! If you miss two days in a row, you're out! This is your first warning. (Timestamp: {timestamp})")
-                print(f"[DEBUG] Sent warning DM to {member.name}")
-            except Exception as e:
-                print(f"[DEBUG] Could not send warning DM to {member.name}: {e}")
-        elif current_warnings == 1:
-            # Check if enough time has passed since the last warning before removing the role
-            if last_warning_time and (current_time - last_warning_time).total_seconds() > TIME_LIMIT:
-                # Second strike - remove role
-                print(f"\n[DEBUG] ATTEMPTING TO REMOVE ROLE FROM {member.name} (Second strike)")
-                try:
-                    await member.remove_roles(role, reason=f"No image posted within {TIME_LIMIT} seconds - second strike")
-                    print(f"[DEBUG] SUCCESS: Removed role from {member.name}")
-                    
-                    # Clear last image time when the role is removed
-                    if member.id in last_image_times:
-                        del last_image_times[member.id]  # Remove the last image time entry
-                    
-                    # Remove the user's reaction
-                    channel = client.get_channel(BUTTON_CHANNEL_ID)
-                    if channel:
-                        async for message in channel.history(limit=50):
-                            if message.author == client.user and "React with ✅ to get the job challenge role!" in message.content:
-                                await message.remove_reaction("✅", member)
-                                break
-                    
-                    # Do not reset warnings after role removal
-                    # user_stats['warnings'][member.id] = 0  # Remove this line
-                    
-                    # Update elimination stats
-                    user_stats['streaks'][member.id] = 0
-                    user_stats['eliminations'].add(member.id)
-                    
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    try:
-                        await member.send(f"Your '{REQUIRED_ROLE_NAME}' role has been removed after two warnings. Better luck next time, you can still continue on your own! (Timestamp: {timestamp})")
-                        print(f"[DEBUG] SUCCESS: Sent removal DM to {member.name}")
-                    except Exception as e:
-                        print(f"[DEBUG] ERROR: Could not send DM to {member.name}: {e}")
-                except discord.Forbidden as e:
-                    print(f"[DEBUG] ERROR: No permission to remove role from {member.name}: {e}")
-                except discord.HTTPException as e:
-                    print(f"[DEBUG] ERROR: HTTP error when removing role from {member.name}: {e}")
-                except Exception as e:
-                    print(f"[DEBUG] ERROR: Unknown error when removing role from {member.name}: {e}")
-
-# STEP 4: Bot events
 @client.event
 async def on_ready() -> None:
     print(f"{client.user} is now running")
+    check_verification_channels.start()
+    check_inactive_verification_tickets.start()
+
+# Load shahada data
+try:
+    with open('shahada_counts.json', 'r') as f:
+        data = json.load(f)
+        shahada_count = data.get('total', 0)
+        shahada_members = data.get('members', [])  # List of member IDs who took shahada
+except FileNotFoundError:
+    shahada_count = 0
+    shahada_members = []
+
+def save_shahada_data():
+    """Helper function to save shahada data to JSON file"""
+    with open('shahada_counts.json', 'w') as f:
+        json.dump({
+            'total': shahada_count,
+            'members': shahada_members
+        }, f)
+
+@client.command(name='shahadacounter')
+@commands.has_any_role('Mod', 'Mini Mod')
+async def shahada_counter(ctx, *, args=None):
+    global shahada_count, shahada_members
     
-    # Set up the reaction message in the specific channel
-    channel = client.get_channel(BUTTON_CHANNEL_ID)
-    if channel:
-        print(f"[DEBUG] Found channel: {channel.name}")
-        try:
-            # Check for existing role message from the bot
-            async for message in channel.history(limit=50):
-                if message.author == client.user and "React with ✅ to get the job challenge role!" in message.content:
-                    print("[DEBUG] Found existing role message, skipping creation")
-                    check_roles.start()
-                    return
-
-            # If no existing message found, create a new one
-            role_message = await channel.send("React with ✅ to get the job challenge role!")
-            await role_message.add_reaction("✅")
-            print("[DEBUG] Created new role message with reaction")
-        except Exception as e:
-            print(f"[DEBUG] Error setting up role message: {e}")
-    else:
-        print(f"[DEBUG] Could not find channel with ID {BUTTON_CHANNEL_ID}")
-
-    # Initialize user states
-    for guild in client.guilds:
-        for member in guild.members:
-            if role in member.roles:  # Check if the member has the required role
-                # Initialize user stats if not already present
-                if member.id not in user_stats['warnings']:
-                    user_stats['warnings'][member.id] = 0
-                    user_stats['streaks'][member.id] = 0
-                    user_stats['total_images'][member.id] = 0
-                    user_stats['eliminations'].discard(member.id)  # Remove from eliminations if they are back
-
-    check_roles.start()
-
-@client.event
-async def on_raw_reaction_add(payload):
-    # Check if bot is enabled first
-    if not global_vars['bot_enabled']:
-        try:
-            channel = client.get_channel(payload.channel_id)
-            if channel:
-                message = await channel.fetch_message(payload.message_id)
-                await message.remove_reaction(payload.emoji, payload.member)
-                await payload.member.send("The challenge is closed now.")
-        except:
-            pass
+    if args is None:
+        await ctx.send("Please provide either a member or a number to set the counter.")
         return
-
-    # Rest of the existing reaction handling code
-    if payload.member.bot:
-        return
-
-    channel = client.get_channel(payload.channel_id)
-    if not channel:
-        return
-
+    
+    # Check if args is just a number
     try:
-        message = await channel.fetch_message(payload.message_id)
-    except:
+        start_number = int(args)
+        shahada_count = start_number
+        shahada_members = []  # Reset the members list since we're starting fresh
+        save_shahada_data()
+        await ctx.send(f"Shahada counter has been set to {start_number}")
         return
+    except ValueError:
+        # Not a number, try to get a member
+        try:
+            # Try to convert mention to member
+            member = await commands.MemberConverter().convert(ctx, args)
+            
+            # Regular shahada counting logic
+            if str(member.id) in shahada_members:
+                await ctx.send(f"{member.mention} has already taken their shahada!")
+                return
+            
+            shahada_count += 1
+            shahada_members.append(str(member.id))
+            save_shahada_data()
+            await ctx.send(f"{member.mention} has taken their shahada. Total count: {shahada_count}! Alhamdulillah!")
+        except commands.MemberNotFound:
+            await ctx.send("Please provide a valid member or number.")
 
-    if message.author == client.user and "React with ✅ to get the job challenge role!" in message.content:
-        if str(payload.emoji) == "✅":
-            role = get(payload.member.guild.roles, name=REQUIRED_ROLE_NAME)
-            if role:
+@client.command(name='removeshahada')
+@commands.has_any_role('Mod', 'Mini Mod')
+async def remove_shahada(ctx, member: discord.Member):
+    global shahada_count, shahada_members
+    
+    if str(member.id) not in shahada_members:
+        await ctx.send(f"{member.mention} has not taken shahada yet.")
+        return
+        
+    if shahada_count > 0:
+        shahada_count -= 1
+        shahada_members.remove(str(member.id))
+        save_shahada_data()
+        await ctx.send(f"Removed shahada count for {member.mention}. New total count: {shahada_count}")
+    else:
+        await ctx.send("There are no shahada counts to remove.")
+
+@client.command(name='listshahadas')
+@commands.has_any_role('Mod', 'Mini Mod')
+async def list_shahadas(ctx):
+    if not shahada_members:
+        await ctx.send("No shahadas have been recorded yet.")
+        return
+        
+    message = "Members who have taken shahada:\n"
+    for member_id in shahada_members:
+        member = ctx.guild.get_member(int(member_id))
+        if member:
+            message += f"• {member.mention}\n"
+    
+    message += f"\nTotal count: {shahada_count}"
+    await ctx.send(message)
+
+@shahada_counter.error
+@remove_shahada.error
+@list_shahadas.error
+async def shahada_error(ctx, error):
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.send("Please specify a valid member.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Please mention a member to track/remove their shahada.")
+    elif isinstance(error, commands.MissingAnyRole):
+        await ctx.send("You don't have permission to use this command.")
+
+# Daily task to check verification channels
+@tasks.loop(time=datetime.time(hour=9, tzinfo=datetime.timezone(datetime.timedelta(hours=-5))))  # 9 AM EST
+async def check_verification_channels():
+    # Get the verification category
+    for guild in client.guilds:
+        verification_category = discord.utils.get(guild.categories, id=1349095399918407731)
+        if verification_category:
+            # Count channels in the category that contain "verification" in their name
+            channel_count = len([
+                channel for channel in verification_category.channels 
+                if "verification" in channel.name.lower()
+            ])
+            
+            # Subtract 1 from the count (for the permanent channel)
+            open_tickets = channel_count
+            
+            # Only send a message if there are open tickets
+            if open_tickets > 0:
+                # Find the reminder channel (changed from mod_channel)
+                reminder_channel = discord.utils.get(guild.channels, id=887834241881227354)
+                if reminder_channel:
+                    await reminder_channel.send(f"There are currently {open_tickets} open verification tickets that need your assistance!")
+
+# New task to check for inactive verification tickets every 10 minutes
+@tasks.loop(minutes=20)
+async def check_inactive_verification_tickets():
+    # Load previously reminded tickets
+    try:
+        with open('reminded_tickets.json', 'r') as f:
+            reminded_tickets = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        reminded_tickets = {}
+    
+    current_time = datetime.datetime.now().timestamp()
+    one_day_seconds = 86400  # 24 hours * 60 minutes * 60 seconds
+    
+    for guild in client.guilds:
+        verification_category = discord.utils.get(guild.categories, id=1349095399918407731)
+        if not verification_category:
+            continue
+            
+        # Find the channel to send reminders to
+        reminder_channel = discord.utils.get(guild.channels, id=887834241881227354)
+        if not reminder_channel:
+            continue
+            
+        inactive_tickets = []
+        original_messages = {}  # Store original reminder messages
+        
+        # Check each verification channel in the category
+        for channel in verification_category.channels:
+            if "verification" in channel.name.lower():
+                channel_id = str(channel.id)
+                
+                # Skip if we've reminded about this ticket in the last 24 hours
+                if channel_id in reminded_tickets:
+                    last_reminder = reminded_tickets[channel_id]
+                    if current_time - last_reminder < one_day_seconds:
+                        continue
+                
+                # Get the last 10 messages in the channel
                 try:
-                    await payload.member.add_roles(role)
-                    # Reset warnings when the role is assigned
-                    user_stats['warnings'][payload.member.id] = 0  # Reset warnings
-                    last_image_times[payload.member.id] = datetime.min  # Ensure this is a datetime object
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    await payload.member.send(f"You have been given the {REQUIRED_ROLE_NAME} role! (Timestamp: {timestamp})")
-                except Exception as e:
-                    print(f"[DEBUG] Error giving role: {e}")
-                    try:
-                        await payload.member.send("There was an error giving you the role. Please contact an administrator.")
-                    except:
-                        pass
+                    messages = [msg async for msg in channel.history(limit=10)]
+                    
+                    # Check if only the bot has sent messages
+                    has_non_bot_message = False
+                    bot_message_count = 0
+                    
+                    for msg in messages:
+                        if msg.author.id == 1346564959835787284:  # Bot ID
+                            bot_message_count += 1
+                        else:
+                            has_non_bot_message = True
+                            break
+                    
+                    # If there are messages but none from non-bot users and bot has 2 or fewer messages,
+                    # consider it inactive
+                    if messages and not has_non_bot_message and bot_message_count <= 2:
+                        inactive_tickets.append(channel)
+                        # Update the last reminder time
+                        reminded_tickets[channel_id] = current_time
+                except discord.Forbidden:
+                    # Skip channels the bot can't read
+                    continue
+        
+        # Send reminder with links if there are inactive tickets
+        if inactive_tickets:
+            reminder_msg = "The following verification tickets has not messaged or been messaged:\n"
+            for ticket in inactive_tickets:
+                reminder_msg += f"• <#{ticket.id}>\n"
+            
+            # Send the reminder message and store the message ID
+            sent_message = await reminder_channel.send(reminder_msg)
+            original_messages[sent_message.id] = inactive_tickets  # Store the message ID with the respective tickets
 
-@client.event
-async def on_raw_reaction_remove(payload):
-    # We don't need to do anything when reactions are removed
-    pass
+    # Save the updated reminded tickets
+    with open('reminded_tickets.json', 'w') as f:
+        json.dump(reminded_tickets, f)
 
+# Listen for replies to the reminder message
 @client.event
 async def on_message(message):
-    # Check if the message is from a user and not a bot
-    if message.author.bot:
-        return
-
-    # Check if the message is in the correct channel and contains attachments
-    if message.channel.id == CHANNEL_ID and message.attachments:
-        # Check if the bot is mentioned in the message
-        if client.user.id in [user.id for user in message.mentions]:  # Check if the bot is mentioned
-            for attachment in message.attachments:
-                if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif']):
-                    last_image_times[message.author.id] = datetime.now()
-                    print(f"[DEBUG] Image posted by {message.author.name} at {last_image_times[message.author.id]}")
-                    
-                    # Update stats
-                    user_stats['streaks'][message.author.id] += 1
-                    user_stats['total_images'][message.author.id] += 1
-                    print(f"[DEBUG] Updated stats for {message.author.name}")
-                    
-                    # Reset warnings when an image is accepted
-                    user_stats['warnings'][message.author.id] = 0  # Reset warnings
-                    print(f"[DEBUG] Warnings reset for {message.author.name}")
-
-                    # Send acceptance message
-                    await message.channel.send(f"✅ {message.author.mention}, your image submission has been accepted!")
-                    break
-        else:
-            # Debug message for image posted without ping
-            print(f"[DEBUG] Image posted by {message.author.name} without mentioning the bot.")
-    
-    await client.process_commands(message)  # This allows commands to still work
-
-@client.command(name='forcereset')
-@commands.has_role('admin')
-async def force_reset(ctx):
-    try:
-        role = get(ctx.guild.roles, name=REQUIRED_ROLE_NAME)
-        if not role:
-            await ctx.send("Could not find job challenge role.")
-            return
+    if message.channel.id == 887834241881227354 and message.reference:
+        # Check if the message is a reply to a reminder message
+        original_message = await message.channel.fetch_message(message.reference.message_id)
+        
+        # Check if the original message is a reminder message
+        if original_message.content.startswith("The following verification tickets need attention"):
+            # Extract the ticket ID from the reply
+            ticket_id = message.content.split("<#")[1].split(">")[0]  # Get the channel ID from the reply
             
-        members_with_role = [member for member in ctx.guild.members if role in member.roles]
-        member_count = len(members_with_role)
+            # Update the original message with a checkmark
+            updated_content = original_message.content.replace(f"• <#{ticket_id}>", f"• <#{ticket_id}> ✅")
+            await original_message.edit(content=updated_content)
+
+# Wait until the bot is ready before starting the tasks
+@check_verification_channels.before_loop
+async def before_check():
+    await client.wait_until_ready()
+
+@check_inactive_verification_tickets.before_loop
+async def before_inactive_check():
+    await client.wait_until_ready()
+
+@client.command(name='jail')
+@commands.has_any_role('Mod', 'Mini Mod')
+async def jail(ctx, member: discord.Member, *, reason=None):
+    # Get the jail role using the specific ID
+    jail_role = ctx.guild.get_role(897591887140098139)
+    
+    # Check if the jail role exists
+    if not jail_role:
+        await ctx.send("Error: The jail role doesn't exist in this server.")
+        return
+    
+    # Check if the bot has permission to manage roles
+    if not ctx.guild.me.guild_permissions.manage_roles:
+        await ctx.send("Error: I don't have permission to manage roles.")
+        return
         
-        await ctx.send(f"Removing job challenge role from {member_count} members...")
+    # Check if the bot's highest role is higher than the member's highest role
+    if ctx.guild.me.top_role <= member.top_role:
+        await ctx.send("Error: I can't jail this member because their highest role is above or equal to my highest role.")
+        return
+    
+    # Check if the command user has permission to jail this member
+    if ctx.author.top_role <= member.top_role and ctx.author.id != ctx.guild.owner_id:
+        await ctx.send("Error: You can't jail someone with a higher or equal role than yourself.")
+        return
+    
+    # Store the member's current roles
+    member_roles = [role.id for role in member.roles if role.name != '@everyone']
+    
+    try:
+        # Remove all roles and add jail role
+        await member.remove_roles(*[role for role in member.roles if role.name != '@everyone'])
+        await member.add_roles(jail_role)
         
-        for member in members_with_role:
-            if member.bot:
-                continue
-            try:
-                await member.remove_roles(role, reason="Force reset by admin")
-                print(f"[DEBUG] Removed role from {member.name}")
-            except Exception as e:
-                print(f"[DEBUG] Error removing role from {member.name}: {e}")
+        # Store the jailed member's info
+        try:
+            with open('jailed_members.json', 'r') as f:
+                jailed_members = json.load(f)
+        except FileNotFoundError:
+            jailed_members = {}
         
-        # Find and clear reactions on the role message
-        channel = client.get_channel(BUTTON_CHANNEL_ID)
-        if channel:
-            async for message in channel.history(limit=50):
-                if message.author == client.user and "React with ✅ to get the job challenge role!" in message.content:
-                    await message.clear_reactions()
-                    await message.add_reaction("✅")
-                    break
+        jailed_members[str(member.id)] = member_roles
         
-        await ctx.send(f"✅ Successfully removed job challenge role from {member_count} members and reset reactions.")
+        with open('jailed_members.json', 'w') as f:
+            json.dump(jailed_members, f)
         
+        # Send confirmation message
+        if reason:
+            await ctx.send(f"{member.mention} has been jailed for: {reason}")
+        else:
+            await ctx.send(f"{member.mention} has been jailed.")
     except discord.Forbidden:
-        await ctx.send("I don't have permission to manage roles.")
+        await ctx.send("I don't have permission to modify this member's roles.")
     except Exception as e:
-        await ctx.send(f"An error occurred: {str(e)}")
+        await ctx.send(f"An error occurred while jailing the member: {str(e)}")
 
-# Add these new commands for stats
-@client.command(name='stats')
-async def show_stats(ctx):
-    user_id = ctx.author.id
-    streak = user_stats['streaks'].get(user_id, 0)
-    days_missed = user_stats['warnings'].get(user_id, 0)  # Use warnings as days missed
+@client.command(name='unjail')
+@commands.has_any_role('Mod', 'Mini Mod')
+async def unjail(ctx, member: discord.Member):
+    # Get the jail role
+    jail_role = discord.utils.get(ctx.guild.roles, name='Jail')
     
-    embed = discord.Embed(title="Your Stats", color=discord.Color.blue())
-    embed.add_field(name="Current Streak", value=f"{streak} days", inline=False)
-    embed.add_field(name="Days Missed", value=str(days_missed), inline=False)
+    # Check if the jail role exists
+    if not jail_role:
+        await ctx.send("Error: The 'Jail' role doesn't exist in this server. Please create it first.")
+        return
     
-    await ctx.send(embed=embed)
+    # Check if member has jail role
+    if jail_role not in member.roles:
+        await ctx.send(f"{member.mention} is not currently jailed.")
+        return
+    
+    # Remove jail role
+    await member.remove_roles(jail_role)
+    
+    # Restore previous roles if available
+    try:
+        with open('jailed_members.json', 'r') as f:
+            jailed_members = json.load(f)
+            
+        if str(member.id) in jailed_members:
+            roles_to_add = []
+            for role_id in jailed_members[str(member.id)]:
+                role = ctx.guild.get_role(role_id)
+                if role:  # Make sure the role still exists
+                    roles_to_add.append(role)
+            
+            if roles_to_add:  # Only try to add roles if there are any
+                await member.add_roles(*roles_to_add)
+            
+            # Remove member from jailed list
+            del jailed_members[str(member.id)]
+            
+            with open('jailed_members.json', 'w') as f:
+                json.dump(jailed_members, f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass  # If file doesn't exist or is invalid, just continue
+    
+    await ctx.send(f"{member.mention} has been released from jail.")
 
-@client.command(name='leaderboard', aliases=['lb'])
-async def show_leaderboard(ctx):
-    # Sort users by total images
-    top_posters = sorted(
-        user_stats['total_images'].items(),
-        key=itemgetter(1),
-        reverse=True
-    )[:10]  # Top 10 only
-    
-    # Get unique eliminated users
-    eliminated_users = set(user_stats['eliminations'])
-    
-    embed = discord.Embed(title="🏆 Job Challenge Leaderboard", color=discord.Color.gold())
-    
-    # Top image posters
-    top_posters_text = ""
-    for i, (user_id, count) in enumerate(top_posters, 1):
-        user = ctx.guild.get_member(user_id)
-        if user:  # Only show users still in the server
-            name = user.name
-            if i == 1:
-                top_posters_text += f"👑 {i}. {name}: {count} images\n"
-            else:
-                top_posters_text += f"{i}. {name}: {count} images\n"
-    embed.add_field(
-        name="📸 Top 10 Image Posters", 
-        value=top_posters_text or "No data yet", 
-        inline=False
-    )
-    
-    # Eliminated users list
-    eliminated_text = ""
-    eliminated_count = 0
-    for user_id in eliminated_users:
-        user = ctx.guild.get_member(user_id)
-        if user:  # Only show users still in the server
-            eliminated_count += 1
-            eliminated_text += f"• {user.name}\n"
-    
-    if eliminated_text:
-        embed.add_field(
-            name=f"❌ Eliminated Users ({eliminated_count})", 
-            value=eliminated_text, 
-            inline=False
-        )
+@jail.error
+@unjail.error
+async def jail_error(ctx, error):
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.send("Please specify a valid member.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Please mention a member to jail/unjail.")
+    elif isinstance(error, commands.MissingAnyRole):
+        await ctx.send("You don't have permission to use this command.")
     else:
-        embed.add_field(
-            name="❌ Eliminated Users", 
-            value="No eliminations yet", 
-            inline=False
-        )
-    
-    # Add total participants
-    total_participants = len(set(user_stats['total_images'].keys()))
-    embed.set_footer(text=f"Total Participants: {total_participants}")
-    
-    await ctx.send(embed=embed)
+        await ctx.send(f"An error occurred: {error}")
 
-@client.command(name='disable')
-@commands.has_role('admin')
-async def disable_bot(ctx):
-    if not global_vars['bot_enabled']:
-        await ctx.send("Bot is already disabled!")
-        return
-        
-    global_vars['bot_enabled'] = False
-    check_roles.stop()  # Stop the role checking task
-    
-    # Find and remove the reaction from the role message
-    channel = client.get_channel(BUTTON_CHANNEL_ID)
-    if channel:
-        async for message in channel.history(limit=50):
-            if message.author == client.user and "React with ✅ to get the job challenge role!" in message.content:
-                await message.clear_reactions()
-                await message.edit(content="🔴 Role assignment is currently disabled.")
-                break
-    
-    embed = discord.Embed(
-        title="Bot Disabled",
-        description="Role checking and assignment have been disabled. Users will keep their current roles.",
-        color=discord.Color.red()
-    )
-    await ctx.send(embed=embed)
-    print("[DEBUG] Bot disabled by admin")
-
-@client.command(name='enable')
-@commands.has_role('admin')
-async def enable_bot(ctx):
-    if global_vars['bot_enabled']:
-        await ctx.send("Bot is already enabled!")
-        return
-        
-    global_vars['bot_enabled'] = True
-    check_roles.start()  # Restart the role checking task
-    
-    # Restore the reaction on the role message
-    channel = client.get_channel(BUTTON_CHANNEL_ID)
-    if channel:
-        async for message in channel.history(limit=50):
-            if message.author == client.user and "🔴 Role assignment is currently disabled." in message.content:
-                await message.edit(content="React with ✅ to get the job challenge role!")
-                await message.add_reaction("✅")
-                break
-    
-    embed = discord.Embed(
-        title="Bot Enabled",
-        description="Role checking and assignment have been enabled. Users must now post images every " + 
-                   f"{TIME_LIMIT} seconds to keep their roles.",
-        color=discord.Color.green()
-    )
-    await ctx.send(embed=embed)
-    print("[DEBUG] Bot enabled by admin")
-
-@client.command(name='status')
-@commands.has_role('admin')
-async def check_status(ctx):
-    status = "Enabled" if global_vars['bot_enabled'] else "Disabled"
-    color = discord.Color.green() if global_vars['bot_enabled'] else discord.Color.red()
-    
-    embed = discord.Embed(
-        title="Bot Status",
-        description=f"Current Status: **{status}**\n" +
-                   f"Time Limit: **{TIME_LIMIT}** seconds\n" +
-                   f"Role Name: **{REQUIRED_ROLE_NAME}**",
-        color=color
-    )
-    await ctx.send(embed=embed)
-
-@client.command(name='guide')
-async def show_guide(ctx):
-    embed = discord.Embed(
-        title="Bot Commands Guide",
-        description="Here's a list of all available commands and their functions:",
-        color=discord.Color.blue()
-    )
-
-    # User Commands
-    embed.add_field(
-        name="📊 User Commands",
-        value=(
-            "**!stats**\n"
-            "• Shows your personal stats\n"
-            "• Displays: Current Streak, Total Images, Times Eliminated, Days Missed\n\n"
-            "**!leaderboard** (or **!lb**)\n"
-            "• Shows the top 10 image posters\n"
-            "• Shows list of eliminated users"
-        ),
-        inline=False
-    )
-
-    # Admin Commands
-    embed.add_field(
-        name="🛠️ Admin Commands",
-        value=(
-            "**!enable**\n"
-            "• Enables the role system\n"
-            "• Restores role assignment and checking\n"
-            "• Adds back the reaction for getting roles\n\n"
-            "**!disable**\n"
-            "• Disables the role system\n"
-            "• Stops role checking and assignment\n"
-            "• Removes the reaction for getting roles\n\n"
-            "**!forcereset**\n"
-            "• Removes the job challenge role from all users\n"
-            "• Resets the role reaction\n"
-            "• Shows how many roles were removed\n\n"
-            "**!status**\n"
-            "• Shows if the bot is enabled or disabled\n"
-            "• Displays current time limit and role name"
-        ),
-        inline=False
-    )
-
-    # How to Get/Keep Role
-    embed.add_field(
-        name="🎯 How to Do the Challenge",
-        value=(
-            "1. React with ✅ to get the role\n"
-            f"2. Post an image every {TIME_LIMIT} seconds to keep it\n"
-            "3. You'll get one warning if you miss the time limit\n"
-            "4. Role is removed after second missed deadline"
-        ),
-        inline=False
-    )
-
-    # Footer
-    embed.set_footer(text="Note: Admin commands require the 'admin' role to use.")
-
-    await ctx.send(embed=embed)
-
-@client.command(name='complete_module_9')
-@commands.has_role('admin')
-async def complete_module_9(ctx, member: discord.Member):
-    user_stats['completed_modules'][member.id].add('Module 9')
-    save_user_stats(member.id)  # Save stats after updating
-    await ctx.send(f"✅ {member.mention} has been marked as completed for Module 9.")
-
-@client.command(name='complete_module_10')
-@commands.has_role('admin')
-async def complete_module_10(ctx, member: discord.Member):
-    # Check if the user is already marked as completed for the modules
-    if 'completed_modules' not in user_stats:
-        user_stats['completed_modules'] = defaultdict(set)  # Initialize if not present
-
-    # Add Module 10 to the user's completed list
-    user_stats['completed_modules'][member.id].add('Module 10')
-
-    # Send confirmation message
-    await ctx.send(f"✅ {member.mention} has been marked as completed for Module 10.")
-    print(f"[DEBUG] {member.name} marked as completed for Module 10.")
-
-
-# STEP 5: Main entry point
 def main() -> None:
     client.run(token=TOKEN)
 
